@@ -1,0 +1,10 @@
+#Mode 1 for no retry at all
+#Mode 2 for Retries
+MODE:1
+
+or 
+#Option 1 for infinite retries
+#Option 2 for two retries at max
+
+#MODE:2
+#OPTION:2
