@@ -2584,8 +2584,8 @@ class BatchRunner:
         logger.info(f"[BATCH] Using {optimal_workers} per-user workers (global limit: {GLOBAL_MAX_CONCURRENT_CHECKS}, active users: {_get_active_user_count()}) for batch of {self.total} cards")
 
         async def run_one(card: Dict):
-            async with global_sem:  # Global limit first
-              async with sem:  # Per-user limit second
+            async with sem:  # Per-user limit first (only PER_USER_MAX tasks compete for global)
+              async with global_sem:  # Global limit second (fair across users)
                 attempts = 0
                 selected_proxy_url: Optional[str] = None
                 while True:
@@ -9034,7 +9034,7 @@ async def cmd_chk(update: Update, context: ContextTypes.DEFAULT_TYPE):
             pass
 
 async def cmd_achk(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Check URLs from a txt file and filter by minimum amount (use by replying to a txt file with /achk)"""
+    """Check URLs from a txt file and filter by amount (use by replying to a txt file with /achk or /achk <amount>)"""
     if not await ensure_access(update, context):
         return
     
@@ -9095,13 +9095,59 @@ async def cmd_achk(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     total_urls = len(urls)
     
+    # Check if amount was provided inline: /achk 10.00
+    full_text = (update.message.text or "").strip()
+    amount_arg = None
+    try:
+        parts = full_text.split(None, 1)
+        if len(parts) > 1:
+            amount_arg = parts[1].strip()
+    except Exception:
+        pass
+    
+    min_amount = None
+    if amount_arg:
+        min_amount = parse_amount(amount_arg)
+    
+    if min_amount is not None:
+        # Amount provided inline — start check immediately
+        await _run_achk_check(update, context, urls, min_amount)
+        return
+    
+    # No amount provided — store URLs and ask for it
+    try:
+        async with ACHK_LOCK:
+            ACHK_PENDING[user.id] = {
+                "urls": urls,
+                "total_urls": total_urls,
+                "stage": "waiting_amount"
+            }
+    except Exception:
+        pass
+    
+    await update.message.reply_text(
+        f"📁 Found <b>{total_urls}</b> URL(s) in the file.\n\n"
+        f"💰 <b>Please enter the maximum amount to filter by</b>\n"
+        f"(e.g., <code>10.00</code> or <code>$10.00</code>)\n\n"
+        f"Only working sites with product price ≤ this amount will be included.\n\n"
+        f"💡 <i>Tip: Use /achk 10.00 (reply to file) to skip this step next time</i>",
+        parse_mode=ParseMode.HTML
+    )
+
+
+async def _run_achk_check(update: Update, context: ContextTypes.DEFAULT_TYPE, urls: list, min_amount: float):
+    """Run the actual achk URL check with the amount filter already known"""
+    user = update.effective_user
+    total_urls = len(urls)
+    
     import uuid
     batch_id = f"achk_{user.id}_{int(time.time())}_{uuid.uuid4().hex[:8]}"
     cancel_event = asyncio.Event()
     
     stop_button = InlineKeyboardMarkup([[InlineKeyboardButton("⏹ Stop", callback_data=f"STOP:{batch_id}")]])
-    checking_msg = await update.message.reply_text(
-        f"🔍 Checking {total_urls} URL(s) from file...\n\nPlease wait...",
+    checking_msg = await update.effective_chat.send_message(
+        f"🔍 Checking {total_urls} URL(s) from file...\n"
+        f"💰 Amount filter: ≤ ${min_amount:.2f}\n\nPlease wait...",
         reply_markup=stop_button
     )
     
@@ -9198,6 +9244,10 @@ async def cmd_achk(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     emoji = "✅"
                     summary = f"{status.upper() if status else 'WORKING'} - {code_display[:50]}"
                     working_count[0] += 1
+                elif "CAPTCHA_REQUIRED" in code_str:
+                    emoji = "✅"
+                    summary = f"WORKING (CAPTCHA) - {code_display[:50]}"
+                    working_count[0] += 1
                 elif "No product" in str(code_display) or "no variant" in str(code_display).lower():
                     emoji = "⚠️"
                     summary = "No Products"
@@ -9228,7 +9278,9 @@ async def cmd_achk(update: Update, context: ContextTypes.DEFAULT_TYPE):
                             async with ACTIVE_LOCK:
                                 if batch_id in ACTIVE_BATCHES and not ACTIVE_BATCHES[batch_id].get("cancelled"):
                                     await checking_msg.edit_text(
-                                        f"🔍 Checking URLs in parallel...\n\n✅ Completed: {completed_count[0]}/{total_urls}\n💚 Working: {working_count[0]}",
+                                        f"🔍 Checking URLs in parallel...\n"
+                                        f"💰 Amount filter: ≤ ${min_amount:.2f}\n\n"
+                                        f"✅ Completed: {completed_count[0]}/{total_urls}\n💚 Working: {working_count[0]}",
                                         reply_markup=stop_button
                                     )
                         except Exception:
@@ -9328,102 +9380,9 @@ async def cmd_achk(update: Update, context: ContextTypes.DEFAULT_TYPE):
     working = sum(1 for r in results if r["emoji"] == "✅")
     no_products = sum(1 for r in results if r["emoji"] == "⚠️")
     failed = sum(1 for r in results if r["emoji"] == "❌")
-    cancelled = sum(1 for r in results if r.get("status") == "cancelled")
+    cancelled_count = sum(1 for r in results if r.get("status") == "cancelled")
     
-    try:
-        async with ACHK_LOCK:
-            ACHK_PENDING[user.id] = {
-                "results": results,
-                "total_urls": total_urls,
-                "checking_msg": checking_msg,
-                "working": working,
-                "no_products": no_products,
-                "failed": failed,
-                "cancelled": cancelled,
-                "was_cancelled": was_cancelled
-            }
-    except Exception:
-        pass
-    
-    try:
-        status_emoji = "⚠️" if was_cancelled else "✅"
-        status_text = "Stopped" if was_cancelled else "Check complete"
-        
-        summary_parts = [f"✅ Working: {working}", f"⚠️ No Products: {no_products}", f"❌ Failed: {failed}"]
-        if was_cancelled and cancelled > 0:
-            summary_parts.append(f"⏹ Cancelled: {cancelled}")
-        
-        await checking_msg.edit_text(
-            f"{status_emoji} {status_text}!\n\n"
-            f"<b>Summary:</b>\n" + "\n".join(summary_parts) + "\n\n"
-            f"💰 <b>Please enter the minimum amount (e.g., 10.00 or $10.00)</b>\n"
-            f"I will show only working sites with product price ≤ this amount.",
-            parse_mode=ParseMode.HTML,
-            reply_markup=None
-        )
-    except Exception:
-        try:
-            await update.message.reply_text(
-                f"{status_emoji} {status_text}!\n\n"
-                f"<b>Summary:</b>\n" + "\n".join(summary_parts) + "\n\n"
-                f"💰 <b>Please enter the minimum amount (e.g., 10.00 or $10.00)</b>\n"
-                f"I will show only working sites with product price ≤ this amount.",
-                parse_mode=ParseMode.HTML
-            )
-        except Exception:
-            pass
-
-async def handle_achk_amount(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle amount input for /achk command"""
-    user = update.effective_user
-    text = (update.message.text or "").strip()
-    
-    has_pending = False
-    try:
-        async with ACHK_LOCK:
-            has_pending = user.id in ACHK_PENDING
-    except Exception:
-        pass
-    
-    if not has_pending:
-        return
-    
-    if not (re.search(r'[\d$]', text)):
-        return
-    
-    pending_data = None
-    try:
-        async with ACHK_LOCK:
-            if user.id in ACHK_PENDING:
-                pending_data = ACHK_PENDING.pop(user.id)
-    except Exception:
-        pass
-    
-    if not pending_data:
-        return
-    
-    min_amount = parse_amount(text)
-    if min_amount is None:
-        try:
-            await update.message.reply_text(
-                "❌ Invalid amount format. Please enter a number (e.g., 10.00 or $10.00)\n\n"
-                "💰 Please try again with a valid amount:"
-            )
-            async with ACHK_LOCK:
-                ACHK_PENDING[user.id] = pending_data
-        except Exception:
-            pass
-        return
-    
-    results = pending_data.get("results", [])
-    total_urls = pending_data.get("total_urls", 0)
-    working = pending_data.get("working", 0)
-    no_products = pending_data.get("no_products", 0)
-    failed = pending_data.get("failed", 0)
-    cancelled = pending_data.get("cancelled", 0)
-    was_cancelled = pending_data.get("was_cancelled", False)
-    checking_msg = pending_data.get("checking_msg")
-    
+    # Filter working results by amount
     filtered_working = []
     for result in results:
         if result["emoji"] == "✅":
@@ -9433,6 +9392,7 @@ async def handle_achk_amount(update: Update, context: ContextTypes.DEFAULT_TYPE)
     
     filtered_working = sorted(filtered_working, key=lambda x: x["url"])
     
+    # Build results file
     file_content = f"# URL Check Results (Amount Filter: ≤ ${min_amount:.2f}) - {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n"
     file_content += f"# Total Checked: {total_urls}\n"
     file_content += f"# Working Sites (All): {working}\n"
@@ -9467,21 +9427,23 @@ async def handle_achk_amount(update: Update, context: ContextTypes.DEFAULT_TYPE)
         tmp_path = tmp.name
     
     try:
-        if checking_msg:
-            try:
-                await checking_msg.edit_text(
-                    f"✅ Filtering complete!\n\n"
-                    f"<b>Summary:</b>\n"
-                    f"✅ Working (All): {working}\n"
-                    f"💰 Working (Amount ≤ ${min_amount:.2f}): {len(filtered_working)}\n"
-                    f"⚠️ No Products: {no_products}\n"
-                    f"❌ Failed: {failed}\n\n"
-                    f"Sending filtered results...",
-                    parse_mode=ParseMode.HTML
-                )
-            except Exception:
-                pass
+        # Update progress message with final summary
+        try:
+            await checking_msg.edit_text(
+                f"✅ Check complete!\n\n"
+                f"<b>Summary:</b>\n"
+                f"✅ Working (All): {working}\n"
+                f"💰 Working (Amount ≤ ${min_amount:.2f}): {len(filtered_working)}\n"
+                f"⚠️ No Products: {no_products}\n"
+                f"❌ Failed: {failed}\n\n"
+                f"Sending filtered results...",
+                parse_mode=ParseMode.HTML,
+                reply_markup=None
+            )
+        except Exception:
+            pass
         
+        # Send file
         try:
             with open(tmp_path, 'rb') as f:
                 caption_parts = [
@@ -9494,10 +9456,10 @@ async def handle_achk_amount(update: Update, context: ContextTypes.DEFAULT_TYPE)
                     f"❌ Failed: {failed}"
                 ]
                 if was_cancelled:
-                    caption_parts.append(f"⏹ Cancelled: {cancelled}")
+                    caption_parts.append(f"⏹ Cancelled: {cancelled_count}")
                     caption_parts.append(f"📝 Note: Check was stopped early. Results show {len(results)}/{total_urls} URLs checked.")
                 
-                await update.message.reply_document(
+                await update.effective_chat.send_document(
                     document=f,
                     filename=f"achk_results_filtered_{min_amount:.2f}_{total_urls}_urls.txt",
                     caption="\n".join(caption_parts)
@@ -9505,15 +9467,15 @@ async def handle_achk_amount(update: Update, context: ContextTypes.DEFAULT_TYPE)
         except Exception as e:
             try:
                 if filtered_working:
-                    working_text = "\n".join([r["url"] for r in filtered_working[:50]])  # Limit to 50 to avoid message too long
+                    working_text = "\n".join([r["url"] for r in filtered_working[:50]])
                     if len(filtered_working) > 50:
                         working_text += f"\n\n... and {len(filtered_working) - 50} more (see file)"
-                    await update.message.reply_text(
+                    await update.effective_chat.send_message(
                         f"📊 Working Sites (Amount ≤ ${min_amount:.2f}) ({len(filtered_working)}):\n\n{working_text}",
                         parse_mode=ParseMode.HTML
                     )
                 else:
-                    await update.message.reply_text(
+                    await update.effective_chat.send_message(
                         f"❌ No working sites found with product price ≤ ${min_amount:.2f}."
                     )
             except Exception:
@@ -9523,6 +9485,67 @@ async def handle_achk_amount(update: Update, context: ContextTypes.DEFAULT_TYPE)
             os.remove(tmp_path)
         except Exception:
             pass
+
+async def handle_achk_amount(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle amount input for /achk command — user sends the amount, then we start the check"""
+    user = update.effective_user
+    text = (update.message.text or "").strip()
+    
+    has_pending = False
+    try:
+        async with ACHK_LOCK:
+            has_pending = user.id in ACHK_PENDING
+    except Exception:
+        pass
+    
+    if not has_pending:
+        return
+    
+    if not (re.search(r'[\d$]', text)):
+        return
+    
+    pending_data = None
+    try:
+        async with ACHK_LOCK:
+            if user.id in ACHK_PENDING:
+                pending_data = ACHK_PENDING.pop(user.id)
+    except Exception:
+        pass
+    
+    if not pending_data:
+        return
+    
+    # Only handle the "waiting_amount" stage (URLs stored, amount not yet given)
+    if pending_data.get("stage") != "waiting_amount":
+        # Put it back if it's not our stage
+        try:
+            async with ACHK_LOCK:
+                ACHK_PENDING[user.id] = pending_data
+        except Exception:
+            pass
+        return
+    
+    min_amount = parse_amount(text)
+    if min_amount is None:
+        try:
+            await update.message.reply_text(
+                "❌ Invalid amount format. Please enter a number (e.g., 10.00 or $10.00)\n\n"
+                "💰 Please try again with a valid amount:"
+            )
+            async with ACHK_LOCK:
+                ACHK_PENDING[user.id] = pending_data
+        except Exception:
+            pass
+        return
+    
+    urls = pending_data.get("urls", [])
+    if not urls:
+        await update.message.reply_text("❌ No URLs found. Please use /achk again.")
+        return
+    
+    # Start the actual check with the amount already known
+    await _run_achk_check(update, context, urls, min_amount)
+
 
 async def cmd_verify(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Admin command: Verify all sites in working_sites.txt"""
