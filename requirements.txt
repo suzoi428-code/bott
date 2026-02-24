@@ -1,0 +1,6 @@
+python-telegram-bot>=20.0
+aiohttp
+httpx
+requests
+urllib3
+curl_cffi
